@@ -156,4 +156,28 @@ void main() {
 
     expect(find.text('Feed di prova'), findsWidgets);
   });
+
+  testApp('al ritorno in primo piano mostra gli articoli scritti da un altro isolate', (tester) async {
+    await launchApp(tester);
+    expect(find.text('Nessun articolo'), findsOneWidget);
+
+    // Una scrittura che Drift non notifica ai suoi stream, come quella del
+    // task in background su un'altra connessione.
+    await tester.runAsync(() async {
+      await db.customStatement(
+          "INSERT INTO feed_sources (title, url) VALUES ('Fonte esterna', 'https://e.it/rss')");
+      await db.customStatement(
+          "INSERT INTO articles (feed_id, guid, title, url, published_at) "
+          "VALUES (1, 'g', 'Notizia scritta in background', 'https://e.it/1', strftime('%s','now'))");
+    });
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('Notizia scritta in background'), findsNothing,
+        reason: 'senza notifica lo stream non deve accorgersene (ipotesi del test)');
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 200)));
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(find.text('Notizia scritta in background'), findsOneWidget);
+  });
 }

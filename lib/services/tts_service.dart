@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'tts_background.dart';
@@ -42,6 +43,14 @@ class TtsService {
   List<TtsItem> _queue = [];
   int _queueIndex = 0;
 
+  // ── Parti del testo in lettura ────────────────────────────────────────────
+  // Il motore TTS di Android rifiuta i testi oltre ~4000 caratteri
+  // ("Text too long"): un articolo lungo si legge a parti, in sequenza.
+  static const maxUtteranceChars = 3500;
+  List<String> _chunks = [];
+  int _chunkIndex = 0;
+  int _chunkOffset = 0; // caratteri delle parti già lette
+
   TtsState get state => _state;
   bool get isPlaying => _state == TtsState.playing;
   bool get isPaused => _state == TtsState.paused;
@@ -70,6 +79,15 @@ class TtsService {
     });
 
     _tts.setCompletionHandler(() async {
+      // Non è finito l'articolo, solo una parte: passa alla successiva senza
+      // segnalare alcuno stop all'interfaccia.
+      if (_chunkIndex < _chunks.length - 1) {
+        _chunkOffset += _chunks[_chunkIndex].length;
+        _chunkIndex++;
+        await _tts.speak(_chunks[_chunkIndex]);
+        return;
+      }
+      _chunks = [];
       _state = TtsState.stopped;
       onStateChange?.call(_state);
       if (_queue.isNotEmpty) {
@@ -97,15 +115,17 @@ class TtsService {
     });
 
     _tts.setErrorHandler((msg) {
+      _chunks = [];
       _state = TtsState.stopped;
       onStateChange?.call(_state);
       onError?.call(msg);
     });
 
     _tts.setProgressHandler((text, start, end, word) {
-      _currentWordStart = start;
-      _currentWordEnd = end;
-      onWordBoundary?.call(start, end);
+      // start/end sono relativi alla parte in lettura: riportati all'intero testo.
+      _currentWordStart = start + _chunkOffset;
+      _currentWordEnd = end + _chunkOffset;
+      onWordBoundary?.call(_currentWordStart, _currentWordEnd);
     });
   }
 
@@ -117,7 +137,43 @@ class TtsService {
     if (_state == TtsState.playing) await _tts.stop();
     await _tts.setLanguage(language);
     await _startForeground(title ?? 'Lettura in corso');
-    await _tts.speak(text);
+    await _speakChunked(text);
+  }
+
+  Future<void> _speakChunked(String text) async {
+    _chunks = splitForSpeech(text);
+    _chunkIndex = 0;
+    _chunkOffset = 0;
+    await _tts.speak(_chunks.first);
+  }
+
+  /// Divide [text] in parti di al massimo [maxChars] caratteri, tagliando
+  /// preferibilmente a fine paragrafo, poi a fine frase, poi su uno spazio.
+  /// Non perde né aggiunge caratteri: le parti, concatenate, ridanno [text].
+  @visibleForTesting
+  static List<String> splitForSpeech(String text, {int maxChars = maxUtteranceChars}) {
+    final chunks = <String>[];
+    var start = 0;
+    while (text.length - start > maxChars) {
+      final window = text.substring(start, start + maxChars);
+      final minCut = maxChars ~/ 3; // niente parti minuscole
+      var cut = -1;
+      final paragraph = window.lastIndexOf('\n\n');
+      if (paragraph >= minCut) cut = paragraph + 2;
+      if (cut < 0) {
+        final sentence = RegExp(r'[.!?…»”"]\s').allMatches(window).lastOrNull;
+        if (sentence != null && sentence.end >= minCut) cut = sentence.end;
+      }
+      if (cut < 0) {
+        final space = RegExp(r'\s').allMatches(window).lastOrNull;
+        if (space != null && space.end > 0) cut = space.end;
+      }
+      if (cut < 0) cut = maxChars; // nessun punto di taglio: taglio netto
+      chunks.add(text.substring(start, start + cut));
+      start += cut;
+    }
+    chunks.add(text.substring(start));
+    return chunks;
   }
 
   Future<void> pause() async {
@@ -127,6 +183,7 @@ class TtsService {
   Future<void> stop() async {
     _queue = [];
     _queueIndex = 0;
+    _chunks = [];
     await _tts.stop();
     _state = TtsState.stopped;
     onStateChange?.call(_state);
@@ -162,7 +219,7 @@ class TtsService {
     onQueueAdvance?.call(_queueIndex, _queue.length, item);
     await _startForeground(item.title);
     await _tts.setLanguage(item.language);
-    await _tts.speak('${item.title}. ${item.text}');
+    await _speakChunked('${item.title}. ${item.text}');
   }
 
   // ── Foreground service ────────────────────────────────────────────────────

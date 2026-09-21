@@ -108,6 +108,33 @@ emulator -list-avds ; adb emu kill                                # elenca / chi
 
 Se compare la finestra Google "Try out your stylus" dopo aver scritto nell'app, è del sistema Android dell'emulatore: chiudila con *Cancel*.
 
+### Provare l'aggiornamento in background
+
+Il task periodico gira a intervalli regolari (da 1 a 12 ore) e WorkManager rifiuta di eseguirlo prima dell'orario previsto, anche se lo forzi: per provarlo senza aspettare servono alcuni passaggi.
+
+1. **Un feed che controlli tu.** Servi un file RSS dal computer e importalo (o aggiungilo a mano) con l'indirizzo `http://10.0.2.2:PORTA/feed.xml` (`10.0.2.2` è il computer visto dall'emulatore):
+   ```bash
+   python3 -m http.server 8765 --bind 0.0.0.0     # nella cartella che contiene feed.xml
+   ```
+   Android blocca l'HTTP in chiaro: **solo per la prova** aggiungi `<application android:usesCleartextTraffic="true" />` in `android/app/src/debug/AndroidManifest.xml` e ricompila. Ricordati di toglierlo dopo (`git checkout android/app/src/debug/AndroidManifest.xml`).
+2. **Prepara lo stato.** Aggiungi il feed, aspetta che venga scaricato una volta, attiva la campanella sulla fonte e l'interruttore **Aggiorna in background** (concedi il permesso notifiche).
+3. **Aggiungi un articolo** al `feed.xml`.
+4. **Sposta avanti l'orologio dell'emulatore** oltre l'intervallo scelto (serve `adb root`; per 3 ore usane 4 o più) e forza il job. L'id del job **cambia a ogni esecuzione**, quindi va riletto ogni volta, e il job sta nel *namespace* di WorkManager:
+   ```bash
+   adb root
+   adb shell settings put global auto_time 0
+   adb shell date $(date -d '+600 min' +%m%d%H%M%Y.%S)
+   JOB=$(adb shell dumpsys jobscheduler | grep -oE "androidx.work.systemjobscheduler:u0a[0-9]+/[0-9]+" | head -1 | sed 's#.*/##')
+   adb shell cmd jobscheduler run -f -n androidx.work.systemjobscheduler com.example.rss_reader $JOB
+   ```
+5. **Controlla** il risultato e rimetti l'orologio a posto:
+   ```bash
+   adb logcat -d | grep WM-WorkerWrapper            # "Worker result SUCCESS"
+   adb shell dumpsys notification --noredact | grep -A40 "pkg=com.example.rss_reader" | grep -E "android.title|android.text"
+   adb shell date $(date +%m%d%H%M%Y.%S); adb shell settings put global auto_time 1; adb unroot
+   ```
+   Se nel log compare "Delaying execution ... because it is being executed before schedule", l'orologio non è andato abbastanza avanti.
+
 ---
 
 ## 📖 Usare l'app
@@ -151,7 +178,11 @@ I test sul database e sul refresh usano SQLite reale in memoria e un server HTTP
 
 `test/widget_test.dart` è il **test di avvio**: costruisce l'app con un database vuoto, naviga tra le schede e apre le fonti consigliate, verificando che non ci siano eccezioni né overflow del layout (con uno schermo come il Pixel 6 dell'emulatore). Sostituisce i plugin nativi con versioni finte e ignora solo gli errori di `google_fonts`, che nei test non può scaricare i font.
 
-**Stato della verifica** — provato su emulatore Android 15 (x86_64) e con i test automatici: avvio, schermata Impostazioni, fonti consigliate, aggiunta feed, lista articoli, estrazione del testo completo su ANSA, ricerca. **Non ancora verificati su dispositivo**: aggiornamento in background e notifiche, TTS, riassunti Gemma, import/export OPML con il selettore file, estrazione su siti con paywall, migrazione di un database già esistente.
+**Stato della verifica** — provato su emulatore Android 15 (x86_64):
+
+- **Verificato sull'emulatore:** avvio, Impostazioni, fonti consigliate, aggiunta feed, lista articoli, estrazione del testo su ANSA, ricerca, import ed export OPML con il selettore file di Android, TTS (voce italiana, lettura di articoli lunghi a parti), aggiornamento in background con notifica (`Worker result SUCCESS`, notifica pubblicata, articoli visibili al ritorno in primo piano).
+- **Verificato con test automatici:** estrazione dal vivo su 57 pagine reali delle 19 fonti del catalogo, migrazione del database dallo schema originale (v2) alla v5, deduplica, ricerca, retention, refresh con server HTTP locale.
+- **Non ancora verificato:** riassunti **Gemma** (serve il modello da ~1,3 GB, e su un emulatore x86 potrebbe non funzionare), l'ascolto effettivo dell'audio (l'emulatore gira senza audio) e un aggiornamento in background su un telefono reale con i risparmi energetici del produttore attivi.
 
 ---
 
@@ -220,5 +251,6 @@ test/                                  # Test unitari e di integrazione (vedi so
 - I duplicati sono nascosti solo in "Tutte le notizie", nella playlist e nella ricerca; restano visibili nel feed di origine. Il confronto tra titoli è un'euristica (soglie in `duplicate_detector.dart`) e può sbagliare su titoli ricorrenti come "Meteo oggi".
 - Il database usa la modalità WAL: l'app e il task in background sono due processi che aprono lo stesso file.
 - Android decide quando eseguire i task periodici (minimo 15 minuti). Alcuni produttori (Xiaomi, Samsung…) bloccano i task in background: se le notifiche non arrivano, controlla le impostazioni di risparmio energetico dell'app.
-- La sintesi vocale usa il motore TTS nativo: assicurati di avere il pacchetto lingua italiana installato.
+- La sintesi vocale usa il motore TTS nativo: assicurati di avere il pacchetto lingua italiana installato. Il motore di Android rifiuta i testi oltre ~4000 caratteri, quindi gli articoli lunghi vengono letti a parti da 3500 caratteri (`TtsService.maxUtteranceChars`), una dopo l'altra.
+- Le scritture del task in background arrivano da un altro isolate: Drift non avvisa le query in tempo reale dell'interfaccia, quindi `HomeScreen` le aggiorna quando l'app torna in primo piano.
 - Gemma richiede Android API 24+.

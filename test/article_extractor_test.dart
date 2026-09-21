@@ -40,4 +40,25 @@ void main() {
   test('htmlToParagraphs mantiene i paragrafi', () {
     expect(RssService.htmlToParagraphs('<p>Uno</p><p>Due</p>'), 'Uno\n\nDue');
   });
+
+  test('anteprima da paywall che finisce con i puntini viene scartata', () {
+    final teaser = '${'Prime righe dell\'articolo prima del paywall, abbastanza lunghe da superare la soglia. ' * 4}Continua…';
+    final html = '<html><head><script type="application/ld+json">{"articleBody":"$teaser"}</script></head><body></body></html>';
+    expect(teaser.length, greaterThan(ArticleExtractor.minLength));
+    expect(ArticleExtractor.extract(html), isNull);
+  });
+
+  test('JSON-LD in un unico blocco viene spezzato in paragrafi senza perdere testo', () {
+    final body = List.generate(30, (i) => 'Questa è la frase numero $i dell\'articolo lungo.').join(' ');
+    final html = '<html><head><script type="application/ld+json">{"articleBody":"$body"}</script></head><body></body></html>';
+    final out = ArticleExtractor.extract(html)!;
+    expect(out.split('\n\n').length, greaterThan(2));
+    expect(out.replaceAll('\n\n', ' '), body);
+  });
+
+  test('un JSON-LD con paragrafi già presenti non viene toccato', () {
+    final body = List.generate(12, (i) => 'Paragrafo $i con abbastanza testo per contare davvero qualcosa qui.').join('\\n\\n');
+    final html = '<html><head><script type="application/ld+json">{"articleBody":"$body"}</script></head><body></body></html>';
+    expect(ArticleExtractor.extract(html)!.split('\n\n').length, 12);
+  });
 }

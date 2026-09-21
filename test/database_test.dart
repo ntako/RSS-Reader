@@ -158,4 +158,49 @@ void main() {
     await old.insertNewArticles(1, [art(1, 'n', 'Nuovo pezzo sul referendum', 'https://v.it/2')]);
     expect((await old.searchArticles('referendum')).length, 1);
   });
+
+  test('migrazione v2 → v5 (app originale) conserva i dati e abilita tutte le funzioni nuove', () async {
+    // Schema della prima versione dell'app: senza etag, lastModified, notify, duplicate_of.
+    final old = AppDatabase.forTesting(NativeDatabase.memory(setup: (raw) {
+      raw.execute('''
+        CREATE TABLE feed_sources (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, url TEXT NOT NULL,
+          description TEXT, icon_url TEXT, category TEXT NOT NULL DEFAULT 'Generale',
+          is_active INTEGER NOT NULL DEFAULT 1, language TEXT, last_fetched INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
+        CREATE TABLE articles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, feed_id INTEGER NOT NULL, guid TEXT NOT NULL,
+          title TEXT NOT NULL, url TEXT NOT NULL, author TEXT, description TEXT, content TEXT,
+          image_url TEXT, ai_summary TEXT, is_read INTEGER NOT NULL DEFAULT 0,
+          is_favorite INTEGER NOT NULL DEFAULT 0, published_at INTEGER,
+          fetched_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));
+        INSERT INTO feed_sources (title, url, category) VALUES ('Vecchio feed', 'https://v.it/rss', 'Politica');
+        INSERT INTO articles (feed_id, guid, title, url, description, ai_summary, is_favorite, published_at)
+          VALUES (1, 'g1', 'Vecchio articolo sulla manovra', 'https://v.it/1', 'testo', 'riassunto salvato', 1, strftime('%s','now'));
+        PRAGMA user_version = 2;
+      ''');
+    }));
+    addTearDown(old.close);
+
+    // Dati preesistenti intatti, con i valori predefiniti delle colonne nuove.
+    final feed = (await old.getAllFeeds()).single;
+    expect((feed.title, feed.category), ('Vecchio feed', 'Politica'));
+    expect(feed.notify, isFalse);
+    expect(feed.etag, isNull);
+    final article = (await old.watchAllArticles().first).single;
+    expect((article.aiSummary, article.isFavorite), ('riassunto salvato', true));
+    expect(article.duplicateOf, isNull);
+
+    // Ricerca sugli articoli già presenti, e sui nuovi tramite i trigger.
+    expect((await old.searchArticles('manovra')).single.id, article.id);
+    await old.insertNewArticles(1, [art(1, 'n', 'Nuovo pezzo sul referendum', 'https://v.it/2')]);
+    expect((await old.searchArticles('referendum')).length, 1);
+
+    // Deduplica e aggiornamento condizionale funzionano sullo schema migrato.
+    await old.insertNewArticles(1, [art(1, 'x', 'Altro titolo', 'https://v.it/1')]);
+    expect((await old.getArticlesAfterId(0, {1})).length, 2); // l'URL doppio non è stato contato
+    await old.updateFeed(feed.copyWith(etag: const Value('"e"'), notify: true));
+    final updated = (await old.getAllFeeds()).single;
+    expect((updated.etag, updated.notify), ('"e"', true));
+  });
 }

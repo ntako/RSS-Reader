@@ -15,8 +15,31 @@ class HomeScreen extends ConsumerStatefulWidget {
   ConsumerState<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends ConsumerState<HomeScreen> {
+class _HomeScreenState extends ConsumerState<HomeScreen>
+    with WidgetsBindingObserver {
   int _tab = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// Il task in background scrive nel database da un altro isolate: le query
+  /// in tempo reale di Drift non lo sanno e la lista resterebbe vecchia.
+  /// Al ritorno in primo piano si dichiarano aggiornate le tabelle.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    final db = ref.read(databaseProvider);
+    db.markTablesUpdated([db.articles, db.feedSources]);
+  }
 
   @override
   Widget build(BuildContext context) {

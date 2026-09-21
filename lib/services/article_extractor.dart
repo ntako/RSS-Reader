@@ -33,7 +33,9 @@ class ArticleExtractor {
 
     // 1. JSON-LD: molti editori pubblicano lì il testo completo.
     final ld = _fromJsonLd(document);
-    if (ld != null && ld.length >= minLength) return ld;
+    if (ld != null && ld.length >= minLength && !_looksTruncated(ld)) {
+      return _paragraphize(ld);
+    }
 
     // 2. Euristica sul DOM.
     for (final el in document.querySelectorAll(
@@ -56,7 +58,36 @@ class ArticleExtractor {
     }
 
     final result = blocks.join('\n\n');
-    return result.length >= minLength ? result : null;
+    return result.length >= minLength && !_looksTruncated(result) ? result : null;
+  }
+
+  /// Le anteprime dei paywall (es. Repubblica: 400 caratteri) finiscono con
+  /// i puntini: superano la soglia minima ma non sono l'articolo.
+  static bool _looksTruncated(String text) {
+    final t = text.trimRight();
+    return t.endsWith('…') || t.endsWith('...');
+  }
+
+  static const _paragraphTarget = 450;
+
+  /// Il JSON-LD spesso porta il testo in un blocco unico (Sole 24 Ore, Corriere):
+  /// senza paragrafi è illeggibile, quindi lo spezza a fine frase ogni ~450
+  /// caratteri. I paragrafi sono approssimati, ma il testo non cambia.
+  static String _paragraphize(String text) {
+    if (text.contains('\n\n') || text.length < 700) return text;
+    final sentences = text.split(RegExp(r'(?<=[.!?…»”])\s+(?=[A-ZÀ-ÖØ-Þ«“"])'));
+    final paragraphs = <String>[];
+    var current = StringBuffer();
+    for (final sentence in sentences) {
+      if (current.length >= _paragraphTarget) {
+        paragraphs.add(current.toString());
+        current = StringBuffer();
+      }
+      if (current.isNotEmpty) current.write(' ');
+      current.write(sentence);
+    }
+    if (current.isNotEmpty) paragraphs.add(current.toString());
+    return paragraphs.join('\n\n');
   }
 
   /// Sceglie il contenitore del corpo: <article> / articleBody se ha abbastanza
