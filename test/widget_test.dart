@@ -34,11 +34,12 @@ void main() {
   }
 
   late AppDatabase db;
+  late Directory docsDir;
 
   setUpAll(() {
     GoogleFonts.config.allowRuntimeFetching = false;
 
-    final docs = Directory.systemTemp.createTempSync('rss_reader_test_');
+    final docs = docsDir = Directory.systemTemp.createTempSync('rss_reader_test_');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
       const MethodChannel('plugins.flutter.io/path_provider'),
@@ -179,5 +180,20 @@ void main() {
     await tester.pump(const Duration(milliseconds: 100));
 
     expect(find.text('Notizia scritta in background'), findsOneWidget);
+  });
+
+  testApp('un modello Gemma che non si carica mostra "Errore" e il motivo in Impostazioni', (tester) async {
+    final model = File('${docsDir.path}/gemma_model.task')..writeAsStringSync('non è un modello');
+    addTearDown(() {
+      if (model.existsSync()) model.deleteSync();
+    });
+
+    await launchApp(tester);
+    await tester.tap(find.text('Impostazioni'));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Errore'), findsOneWidget);
+    expect(find.textContaining('Il modello installato non si carica'), findsOneWidget);
+    expect(find.text('Verifica…'), findsNothing, reason: 'non deve restare in "Verifica…" per sempre');
   });
 }

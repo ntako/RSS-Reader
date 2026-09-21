@@ -402,6 +402,15 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
               ),
             ),
           ] else ...[
+            if (modelState == GemmaModelState.error) ...[
+              Text(
+                'Il modello installato non si carica:\n'
+                '${ref.read(gemmaModelProvider.notifier).lastError ?? 'errore sconosciuto'}\n'
+                'Scegli un altro file (formato LiteRT).',
+                style: tt.bodySmall?.copyWith(color: AppTheme.error),
+              ),
+              const SizedBox(height: 12),
+            ],
             Text(
               'Scarica da Kaggle → tab LiteRT → gemma-2-2b-it-cpu-int4 (~1.3 GB). '
               'Formati supportati: .task, .bin, .tflite (anche in .zip o .tar.gz).',
@@ -478,6 +487,7 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
       GemmaModelState.downloading => ('Download…', AppTheme.accent),
       GemmaModelState.checking   => ('Verifica…', AppTheme.textMuted),
       GemmaModelState.notDownloaded => ('Non configurato', AppTheme.textMuted),
+      GemmaModelState.error      => ('Errore', AppTheme.error),
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),

@@ -153,6 +153,12 @@ Gemma è già integrato (`flutter_gemma`), serve solo il modello:
 2. In *Impostazioni → Gemma AI* scegli **Scegli file locale** oppure incolla un **URL download**.
 3. Nel reader tocca **Riassunto AI**.
 
+**Se qualcosa non va lo vedi.** Un modello che non si carica all'avvio mostra il chip rosso **Errore** in *Impostazioni → Gemma AI* con il motivo, e nel reader compare "Modello Gemma non caricabile". Un riassunto che fallisce mostra un messaggio che dice la fase (creazione della sessione, invio del testo, generazione) e, per gli articoli lunghi, quale parte (*parte 2 di 4*, *riassunto finale*). Gli stessi dettagli, con lo stack, sono nel log:
+
+```bash
+adb logcat -s flutter:V | grep "\[Gemma\]"
+```
+
 Gli articoli lunghi sono divisi in blocchi da ~1800 caratteri (massimo 6): ogni blocco viene riassunto e poi i riassunti parziali vengono riassunti di nuovo. La finestra di contesto è di 1024 token (`_maxTokens` in `lib/services/gemma_service.dart`): se il modello non parte su un telefono con poca RAM, abbassa `_maxTokens` e `chunkChars`. Su un emulatore Gemma può essere molto lento o non funzionare: meglio un dispositivo reale.
 
 ---
@@ -182,7 +188,8 @@ I test sul database e sul refresh usano SQLite reale in memoria e un server HTTP
 
 - **Verificato sull'emulatore:** avvio, Impostazioni, fonti consigliate, aggiunta feed, lista articoli, estrazione del testo su ANSA, ricerca, import ed export OPML con il selettore file di Android, TTS (voce italiana, lettura di articoli lunghi a parti), aggiornamento in background con notifica (`Worker result SUCCESS`, notifica pubblicata, articoli visibili al ritorno in primo piano).
 - **Verificato con test automatici:** estrazione dal vivo su 57 pagine reali delle 19 fonti del catalogo, migrazione del database dallo schema originale (v2) alla v5, deduplica, ricerca, retention, refresh con server HTTP locale.
-- **Non ancora verificato:** riassunti **Gemma** (serve il modello da ~1,3 GB, e su un emulatore x86 potrebbe non funzionare), l'ascolto effettivo dell'audio (l'emulatore gira senza audio) e un aggiornamento in background su un telefono reale con i risparmi energetici del produttore attivi.
+- **Gemma, solo il caso di errore:** con un file non valido al posto del modello l'app non va in crash e mostra lo stato **Errore** con il motivo. La pipeline dei riassunti è coperta da test con un modello finto.
+- **Non ancora verificato:** i riassunti **Gemma** con un modello vero (serve il file da ~1,3 GB, e su un emulatore x86 potrebbe non funzionare), l'ascolto effettivo dell'audio (l'emulatore gira senza audio) e un aggiornamento in background su un telefono reale con i risparmi energetici del produttore attivi.
 
 ---
 

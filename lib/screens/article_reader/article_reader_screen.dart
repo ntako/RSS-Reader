@@ -354,16 +354,16 @@ class _ArticleReaderScreenState extends ConsumerState<ArticleReaderScreen> {
     try {
       final gemma = ref.read(gemmaServiceProvider);
       final summary = await gemma.summarize(_article!.title, content);
-      if (summary != null) {
-        await ref.read(databaseProvider).saveAiSummary(_article!.id, summary);
-        await _loadArticle(); // ricarica con summary
-        setState(() => _showSummary = true);
-      }
+      await ref.read(databaseProvider).saveAiSummary(_article!.id, summary);
+      await _loadArticle(); // ricarica con summary
+      setState(() => _showSummary = true);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Errore Gemma: $e'), backgroundColor: AppTheme.error),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(e is GemmaException ? '$e' : 'Errore Gemma: $e'),
+          backgroundColor: AppTheme.error,
+          duration: const Duration(seconds: 10),
+        ));
       }
     } finally {
       if (mounted) setState(() => _isLoadingSummary = false);
@@ -406,8 +406,9 @@ class _AiSummarySection extends ConsumerWidget {
     final ttsState = ref.watch(ttsStateProvider);
     final isSummaryPlaying = ttsState != TtsState.stopped && article.aiSummary != null;
 
-    // Modello non caricato → rimanda a Impostazioni
-    if (modelState == GemmaModelState.notDownloaded) {
+    // Modello non caricato (o non caricabile) → rimanda a Impostazioni
+    if (modelState == GemmaModelState.notDownloaded || modelState == GemmaModelState.error) {
+      final failed = modelState == GemmaModelState.error;
       return GestureDetector(
         onTap: () {
           Navigator.of(context).popUntil((r) => r.isFirst);
@@ -424,21 +425,23 @@ class _AiSummarySection extends ConsumerWidget {
             children: [
               const Icon(Icons.auto_awesome, size: 16, color: AppTheme.accent),
               const SizedBox(width: 10),
-              const Expanded(
+              Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Modello Gemma non caricato',
+                      failed ? 'Modello Gemma non caricabile' : 'Modello Gemma non caricato',
                       style: TextStyle(
-                          color: AppTheme.textSecondary,
+                          color: failed ? AppTheme.error : AppTheme.textSecondary,
                           fontSize: 13,
                           fontWeight: FontWeight.w500),
                     ),
-                    SizedBox(height: 2),
+                    const SizedBox(height: 2),
                     Text(
-                      'Vai in Impostazioni → "Scegli file locale" se hai già il .bin',
-                      style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
+                      failed
+                          ? 'Vai in Impostazioni per il dettaglio dell\'errore'
+                          : 'Vai in Impostazioni → "Scegli file locale" se hai già il .bin',
+                      style: const TextStyle(color: AppTheme.textMuted, fontSize: 11),
                     ),
                   ],
                 ),

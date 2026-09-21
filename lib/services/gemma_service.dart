@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:archive/archive_io.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:http/http.dart' as http;
@@ -9,10 +10,39 @@ import 'package:tar/tar.dart';
 
 enum GemmaStatus { notLoaded, loading, ready, error }
 
+/// Un riassunto che non è riuscito, con la fase in cui si è fermato (creazione
+/// della sessione, invio del testo, generazione…) e, per gli articoli lunghi,
+/// la parte interessata. Il messaggio è pensato per essere mostrato all'utente.
+class GemmaException implements Exception {
+  final String stage;
+  final Object cause;
+  final String? part;
+
+  const GemmaException(this.stage, this.cause, {this.part});
+
+  GemmaException withPart(String part) => GemmaException(stage, cause, part: part);
+
+  @override
+  String toString() =>
+      'Riassunto non riuscito${part != null ? ' ($part)' : ''}: $stage — $cause';
+}
+
+/// Esegue un prompt sul modello e restituisce il testo generato.
+typedef PromptRunner = Future<String> Function(String prompt);
+
 class GemmaService {
+  GemmaService();
+
+  /// Per i test: usa [runner] al posto del modello vero, già "caricato".
+  @visibleForTesting
+  GemmaService.withRunner(PromptRunner runner)
+      : _runner = runner,
+        _status = GemmaStatus.ready;
+
   GemmaStatus _status = GemmaStatus.notLoaded;
   String? _errorMessage;
   InferenceModel? _model;
+  PromptRunner? _runner;
 
   GemmaStatus get status => _status;
   bool get isReady => _status == GemmaStatus.ready;
@@ -64,9 +94,10 @@ class GemmaService {
       );
 
       _status = GemmaStatus.ready;
-    } catch (e) {
+    } catch (e, st) {
       _status = GemmaStatus.error;
       _errorMessage = e.toString();
+      debugPrint('[Gemma] caricamento del modello fallito: $e\n$st');
       rethrow;
     }
   }
@@ -84,10 +115,15 @@ class GemmaService {
   static const _maxChunks = 6;
 
   /// Riassume l'articolo. Se supera un blocco lo riassume a pezzi e poi
-  /// riassume i riassunti parziali.
-  Future<String?> summarize(String title, String content) async {
-    if (!isReady || _model == null) return null;
-    if (content.trim().isEmpty) return null;
+  /// riassume i riassunti parziali. Non ritorna mai un risultato vuoto: se
+  /// qualcosa non va lancia una [GemmaException] che dice dove.
+  Future<String> summarize(String title, String content) async {
+    if (!isReady || (_model == null && _runner == null)) {
+      throw const GemmaException('modello non caricato', 'caricalo da Impostazioni');
+    }
+    if (content.trim().isEmpty) {
+      throw const GemmaException('articolo senza testo', 'niente da riassumere');
+    }
 
     final chunks = splitIntoChunks(content, chunkChars).take(_maxChunks).toList();
     if (chunks.length == 1) {
@@ -96,14 +132,20 @@ class GemmaService {
 
     final partials = <String>[];
     for (var i = 0; i < chunks.length; i++) {
-      final part = await _generate(_buildPartPrompt(title, chunks[i], i + 1, chunks.length));
-      if (part != null) partials.add(part);
+      try {
+        partials.add(await _generate(_buildPartPrompt(title, chunks[i], i + 1, chunks.length)));
+      } on GemmaException catch (e) {
+        throw e.withPart('parte ${i + 1} di ${chunks.length}');
+      }
     }
-    if (partials.isEmpty) return null;
 
     var merged = partials.join('\n');
     if (merged.length > chunkChars) merged = merged.substring(0, chunkChars);
-    return _generate(_buildPrompt(title, merged));
+    try {
+      return await _generate(_buildPrompt(title, merged));
+    } on GemmaException catch (e) {
+      throw e.withPart('riassunto finale');
+    }
   }
 
   /// Versione streaming: emette token man mano che il modello li genera.
@@ -131,19 +173,37 @@ class GemmaService {
     }
   }
 
-  Future<String?> _generate(String prompt) async {
+  Future<String> _generate(String prompt) async {
+    try {
+      final text = (await (_runner ?? _runOnModel)(prompt)).trim();
+      if (text.isEmpty) {
+        throw const GemmaException('generazione', 'il modello ha restituito una risposta vuota');
+      }
+      return text;
+    } on GemmaException catch (e, st) {
+      debugPrint('[Gemma] $e\n$st');
+      rethrow;
+    } catch (e, st) {
+      debugPrint('[Gemma] generazione fallita: $e\n$st');
+      throw GemmaException('generazione', e);
+    }
+  }
+
+  Future<String> _runOnModel(String prompt) async {
     InferenceModelSession? session;
+    var step = 'creazione della sessione';
     try {
       session = await _model!.createSession(
         temperature: 0.8,
         randomSeed: 1,
         topK: 1,
       );
+      step = 'invio del testo';
       await session.addQueryChunk(Message(text: prompt, isUser: true));
-      final result = await session.getResponse();
-      return result.trim().isEmpty ? null : result.trim();
-    } catch (_) {
-      return null;
+      step = 'generazione';
+      return await session.getResponse();
+    } catch (e) {
+      throw GemmaException(step, e);
     } finally {
       await session?.close();
     }

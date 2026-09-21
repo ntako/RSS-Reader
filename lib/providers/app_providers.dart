@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../database/database.dart';
 import '../services/rss_service.dart';
@@ -6,22 +7,35 @@ import '../services/gemma_service.dart';
 
 // ── Gemma model lifecycle ──────────────────────────────────────────────────────
 
-enum GemmaModelState { checking, notDownloaded, downloading, ready }
+enum GemmaModelState { checking, notDownloaded, downloading, ready, error }
 
 class GemmaModelNotifier extends StateNotifier<(GemmaModelState, double)> {
   final GemmaService _service;
 
+  /// Motivo dell'ultimo caricamento fallito (stato [GemmaModelState.error]).
+  String? lastError;
+
   GemmaModelNotifier(this._service) : super((GemmaModelState.checking, 0)) {
-    _init();
+    init();
   }
 
-  Future<void> _init() async {
-    final downloaded = await GemmaService.isModelDownloaded();
-    if (downloaded) {
-      await _service.loadModel();
-      state = (GemmaModelState.ready, 1);
-    } else {
-      state = (GemmaModelState.notDownloaded, 0);
+  /// All'avvio carica il modello già installato. Se il file c'è ma non si
+  /// carica (formato sbagliato, memoria, finestra di contesto…) lo stato
+  /// diventa [GemmaModelState.error] invece di restare "Verifica…" per sempre.
+  @visibleForTesting
+  Future<void> init() async {
+    try {
+      final downloaded = await GemmaService.isModelDownloaded();
+      if (downloaded) {
+        await _service.loadModel();
+        lastError = null;
+        state = (GemmaModelState.ready, 1);
+      } else {
+        state = (GemmaModelState.notDownloaded, 0);
+      }
+    } catch (e) {
+      lastError = '$e';
+      state = (GemmaModelState.error, 0);
     }
   }
 
