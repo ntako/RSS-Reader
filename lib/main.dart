@@ -5,6 +5,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'theme/app_theme.dart';
 import 'screens/home_screen.dart';
+import 'services/background_refresh.dart';
+import 'services/notification_service.dart';
 import 'services/tts_background.dart'; // registra startCallback
 
 void main() async {
@@ -12,6 +14,8 @@ void main() async {
   await initializeDateFormatting('it', null);
 
   await FlutterGemma.initialize();
+  await NotificationService.init();
+  await BackgroundRefresh.init();
 
   FlutterForegroundTask.initCommunicationPort();
   FlutterForegroundTask.init(

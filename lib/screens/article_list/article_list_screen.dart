@@ -6,6 +6,7 @@ import '../../providers/app_providers.dart';
 import '../../services/tts_service.dart';
 import '../../widgets/common_widgets.dart';
 import '../article_reader/article_reader_screen.dart';
+import '../search/search_screen.dart';
 
 class ArticleListScreen extends ConsumerWidget {
   final int? feedId;
@@ -24,6 +25,14 @@ class ArticleListScreen extends ConsumerWidget {
       appBar: AppBar(
         title: Text(title),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.search),
+            tooltip: 'Cerca',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const SearchScreen()),
+            ),
+          ),
           // Pulsante play playlist
           articlesAsync.whenOrNull(
             data: (articles) => feedsAsync.whenOrNull(

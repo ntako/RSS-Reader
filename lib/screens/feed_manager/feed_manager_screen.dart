@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -7,6 +9,11 @@ import '../../database/database.dart';
 import '../../providers/app_providers.dart';
 import '../../services/rss_service.dart';
 import '../../services/gemma_service.dart';
+import '../../services/opml_service.dart';
+import 'background_settings_card.dart';
+import 'recommended_feeds_screen.dart';
+import '../../services/app_settings.dart';
+import '../../services/notification_service.dart';
 
 class FeedManagerScreen extends ConsumerStatefulWidget {
   const FeedManagerScreen({super.key});
@@ -30,40 +37,64 @@ class _FeedManagerScreenState extends ConsumerState<FeedManagerScreen> {
             tooltip: 'Aggiungi feed',
             onPressed: () => _showAddFeedDialog(context),
           ),
+          PopupMenuButton<String>(
+            color: AppTheme.surfaceHigh,
+            onSelected: (v) {
+              switch (v) {
+                case 'recommended':
+                  Navigator.push(context, MaterialPageRoute(
+                    builder: (_) => const RecommendedFeedsScreen(),
+                  ));
+                case 'import':
+                  _importOpml();
+                case 'export':
+                  _exportOpml();
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'recommended', child: Text('Fonti consigliate', style: TextStyle(color: AppTheme.textPrimary))),
+              PopupMenuItem(value: 'import', child: Text('Importa OPML', style: TextStyle(color: AppTheme.textPrimary))),
+              PopupMenuItem(value: 'export', child: Text('Esporta OPML', style: TextStyle(color: AppTheme.textPrimary))),
+            ],
+          ),
         ],
       ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      // Tutta la pagina scorre: con le card in alto una Column + Expanded
+      // andava in overflow quando la lista delle fonti era vuota.
+      body: ListView(
+        padding: const EdgeInsets.only(bottom: 96),
         children: [
           // ── Gemma AI ───────────────────────────────────────────────────────
           const _GemmaSettingsCard(),
+          const Divider(height: 1),
+          // ── Aggiornamento in background ────────────────────────────────────
+          const BackgroundSettingsCard(),
           const Divider(height: 1),
           // ── Fonti RSS ──────────────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
             child: Text('Fonti RSS', style: tt.labelLarge),
           ),
-          Expanded(
-            child: feedsAsync.when(
-              data: (feeds) {
-                if (feeds.isEmpty) return _emptyState(context, tt);
-                return ListView.builder(
-                  padding: const EdgeInsets.only(bottom: 80, top: 4),
-                  itemCount: feeds.length,
-                  itemBuilder: (_, i) {
-                    final feed = feeds[i];
-                    return _FeedListTile(
-                      feed: feed,
-                      onEdit: () => _showEditFeedDialog(context, feed),
-                      onDelete: () => _confirmDelete(context, feed),
-                      onRefresh: () => _refreshFeed(feed),
-                    );
-                  },
-                );
-              },
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error: (e, _) => Center(child: Text('Errore: $e')),
-            ),
+          ...feedsAsync.when(
+            data: (feeds) => feeds.isEmpty
+                ? [_emptyState(context, tt)]
+                : [
+                    for (final feed in feeds)
+                      _FeedListTile(
+                        feed: feed,
+                        onEdit: () => _showEditFeedDialog(context, feed),
+                        onDelete: () => _confirmDelete(context, feed),
+                        onRefresh: () => _refreshFeed(feed),
+                        onToggleNotify: () => _toggleNotify(feed),
+                      ),
+                  ],
+            loading: () => [
+              const Padding(
+                padding: EdgeInsets.all(40),
+                child: Center(child: CircularProgressIndicator()),
+              ),
+            ],
+            error: (e, _) => [Center(child: Text('Errore: $e'))],
           ),
         ],
       ),
@@ -82,7 +113,7 @@ class _FeedManagerScreenState extends ConsumerState<FeedManagerScreen> {
       child: Padding(
         padding: const EdgeInsets.all(40),
         child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
           children: [
             Icon(Icons.rss_feed, size: 64, color: AppTheme.accent.withOpacity(0.4)),
             const SizedBox(height: 20),
@@ -98,6 +129,12 @@ class _FeedManagerScreenState extends ConsumerState<FeedManagerScreen> {
               onPressed: () => _showAddFeedDialog(context),
               icon: const Icon(Icons.add),
               label: const Text('Aggiungi feed'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.push(context, MaterialPageRoute(
+                builder: (_) => const RecommendedFeedsScreen(),
+              )),
+              child: const Text('Oppure scegli tra le fonti consigliate'),
             ),
           ],
         ),
@@ -202,6 +239,71 @@ class _FeedManagerScreenState extends ConsumerState<FeedManagerScreen> {
         );
       }
     }
+  }
+
+  Future<void> _toggleNotify(FeedSource feed) async {
+    final enable = !feed.notify;
+    if (enable) {
+      if (!await NotificationService.requestPermission()) {
+        _snack('Permesso notifiche negato: abilitalo dalle impostazioni di Android.', error: true);
+        return;
+      }
+      if (!await AppSettings.backgroundRefreshEnabled()) {
+        _snack('Attiva "Aggiorna in background" per ricevere gli avvisi.');
+      }
+    }
+    await ref.read(databaseProvider).updateFeed(feed.copyWith(notify: enable));
+  }
+
+  void _snack(String message, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      backgroundColor: error ? AppTheme.error : AppTheme.success,
+    ));
+  }
+
+  Future<void> _importOpml() async {
+    final result = await FilePicker.platform.pickFiles(type: FileType.any, withData: true);
+    final bytes = result?.files.single.bytes;
+    if (bytes == null) return;
+
+    try {
+      final parsed = OpmlService.parse(utf8.decode(bytes, allowMalformed: true));
+      final valid = parsed.where((f) => f.url.length <= 500 && Uri.tryParse(f.url)?.hasScheme == true);
+      final added = await ref.read(databaseProvider).insertFeedsSkippingExisting([
+        for (final f in valid)
+          FeedSourcesCompanion.insert(
+            title: f.title.length > 200 ? f.title.substring(0, 200) : f.title,
+            url: f.url,
+            category: Value(f.category),
+            language: Value(f.language),
+          ),
+      ]);
+      _snack(
+        added == 0
+            ? 'Nessuna nuova fonte: erano già tutte presenti.'
+            : '$added fonti importate (${valid.length - added} già presenti)',
+      );
+      if (added > 0) ref.read(rssServiceProvider).fetchAllFeeds();
+    } on FormatException catch (e) {
+      _snack(e.message, error: true);
+    }
+  }
+
+  Future<void> _exportOpml() async {
+    final feeds = await ref.read(databaseProvider).getAllFeeds();
+    if (feeds.isEmpty) {
+      _snack('Nessuna fonte da esportare.', error: true);
+      return;
+    }
+    final xml = OpmlService.export(feeds);
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: 'Esporta fonti',
+      fileName: 'lettore-rss.opml',
+      bytes: Uint8List.fromList(utf8.encode(xml)),
+    );
+    if (path != null) _snack('${feeds.length} fonti esportate');
   }
 
   Future<void> _refreshFeedByUrl(String url) async {
@@ -396,12 +498,14 @@ class _FeedListTile extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onRefresh;
+  final VoidCallback onToggleNotify;
 
   const _FeedListTile({
     required this.feed,
     required this.onEdit,
     required this.onDelete,
     required this.onRefresh,
+    required this.onToggleNotify,
   });
 
   @override
@@ -462,6 +566,15 @@ class _FeedListTile extends StatelessWidget {
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            IconButton(
+              icon: Icon(
+                feed.notify ? Icons.notifications_active : Icons.notifications_none,
+                size: 20,
+                color: feed.notify ? AppTheme.accent : AppTheme.textMuted,
+              ),
+              onPressed: onToggleNotify,
+              tooltip: feed.notify ? 'Disattiva notifiche' : 'Notifica nuovi articoli',
+            ),
             IconButton(
               icon: const Icon(Icons.refresh, size: 20, color: AppTheme.textMuted),
               onPressed: onRefresh,

@@ -60,7 +60,7 @@ class GemmaService {
       _model = await FlutterGemmaPlugin.instance.createModel(
         modelType: ModelType.gemmaIt,
         fileType: fileType,
-        maxTokens: 512,
+        maxTokens: _maxTokens,
       );
 
       _status = GemmaStatus.ready;
@@ -73,37 +73,47 @@ class GemmaService {
 
   // ── Inferenza ─────────────────────────────────────────────────────────────
 
+  /// Finestra di contesto (prompt + risposta) richiesta al modello.
+  static const _maxTokens = 1024;
+
+  /// Caratteri per blocco: ~600 token in italiano, così prompt e risposta
+  /// restano dentro `_maxTokens`.
+  static const chunkChars = 1800;
+
+  /// Blocchi processati al massimo; oltre, il resto dell'articolo è ignorato.
+  static const _maxChunks = 6;
+
+  /// Riassume l'articolo. Se supera un blocco lo riassume a pezzi e poi
+  /// riassume i riassunti parziali.
   Future<String?> summarize(String title, String content) async {
     if (!isReady || _model == null) return null;
     if (content.trim().isEmpty) return null;
 
-    final truncated = content.length > 3000 ? content.substring(0, 3000) : content;
-    final prompt = _buildPrompt(title, truncated);
-
-    InferenceModelSession? session;
-    try {
-      session = await _model!.createSession(
-        temperature: 0.8,
-        randomSeed: 1,
-        topK: 1,
-      );
-      await session.addQueryChunk(Message(text: prompt, isUser: true));
-      final result = await session.getResponse();
-      return result.trim().isEmpty ? null : result.trim();
-    } catch (_) {
-      return null;
-    } finally {
-      await session?.close();
+    final chunks = splitIntoChunks(content, chunkChars).take(_maxChunks).toList();
+    if (chunks.length == 1) {
+      return _generate(_buildPrompt(title, chunks.first));
     }
+
+    final partials = <String>[];
+    for (var i = 0; i < chunks.length; i++) {
+      final part = await _generate(_buildPartPrompt(title, chunks[i], i + 1, chunks.length));
+      if (part != null) partials.add(part);
+    }
+    if (partials.isEmpty) return null;
+
+    var merged = partials.join('\n');
+    if (merged.length > chunkChars) merged = merged.substring(0, chunkChars);
+    return _generate(_buildPrompt(title, merged));
   }
 
   /// Versione streaming: emette token man mano che il modello li genera.
+  /// Usa solo il primo blocco dell'articolo.
   Stream<String> summarizeStream(String title, String content) async* {
     if (!isReady || _model == null) return;
     if (content.trim().isEmpty) return;
 
-    final truncated = content.length > 3000 ? content.substring(0, 3000) : content;
-    final prompt = _buildPrompt(title, truncated);
+    final first = splitIntoChunks(content, chunkChars).first;
+    final prompt = _buildPrompt(title, first);
 
     InferenceModelSession? session;
     try {
@@ -121,10 +131,67 @@ class GemmaService {
     }
   }
 
+  Future<String?> _generate(String prompt) async {
+    InferenceModelSession? session;
+    try {
+      session = await _model!.createSession(
+        temperature: 0.8,
+        randomSeed: 1,
+        topK: 1,
+      );
+      await session.addQueryChunk(Message(text: prompt, isUser: true));
+      final result = await session.getResponse();
+      return result.trim().isEmpty ? null : result.trim();
+    } catch (_) {
+      return null;
+    } finally {
+      await session?.close();
+    }
+  }
+
+  /// Divide il testo in blocchi di al massimo [max] caratteri, spezzando
+  /// preferibilmente ai confini di paragrafo, poi di frase.
+  static List<String> splitIntoChunks(String text, int max) {
+    final pieces = <String>[];
+    for (final para in text.trim().split(RegExp(r'\n\s*\n'))) {
+      if (para.trim().isEmpty) continue;
+      if (para.length <= max) {
+        pieces.add(para.trim());
+        continue;
+      }
+      for (final sentence in para.split(RegExp(r'(?<=[.!?])\s+'))) {
+        var rest = sentence;
+        while (rest.length > max) {
+          pieces.add(rest.substring(0, max));
+          rest = rest.substring(max);
+        }
+        if (rest.trim().isNotEmpty) pieces.add(rest.trim());
+      }
+    }
+
+    final chunks = <String>[];
+    var current = StringBuffer();
+    for (final piece in pieces) {
+      if (current.isNotEmpty && current.length + piece.length + 2 > max) {
+        chunks.add(current.toString());
+        current = StringBuffer();
+      }
+      if (current.isNotEmpty) current.write('\n\n');
+      current.write(piece);
+    }
+    if (current.isNotEmpty) chunks.add(current.toString());
+    return chunks.isEmpty ? [text.trim()] : chunks;
+  }
+
   String _buildPrompt(String title, String content) =>
       'Riassumi il seguente articolo in italiano in 3-4 frasi concise, '
       'evidenziando i punti principali. Sii diretto e informativo.\n\n'
       'Titolo: $title\n\nArticolo:\n$content\n\nRiassunto:';
+
+  String _buildPartPrompt(String title, String content, int n, int total) =>
+      'Riassumi in italiano in 2 frasi questa parte ($n di $total) '
+      'dell\'articolo. Sii diretto e informativo.\n\n'
+      'Titolo: $title\n\nParte $n:\n$content\n\nRiassunto:';
 
   // ── Import file locale ────────────────────────────────────────────────────
 

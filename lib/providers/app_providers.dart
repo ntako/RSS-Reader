@@ -171,7 +171,7 @@ List<TtsItem> buildTtsPlaylist(
   return articles
       .map((a) {
         final lang = langToTtsLocale(feedMap[a.feedId]?.language);
-        final text = RssService.extractReadableText(a.content ?? a.description);
+        final text = RssService.articleText(a.content, a.description);
         if (text.isEmpty && a.title.isEmpty) return null;
         return TtsItem(
           articleId: a.id,

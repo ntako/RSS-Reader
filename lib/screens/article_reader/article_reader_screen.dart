@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:drift/drift.dart' show Value;
 import '../../theme/app_theme.dart';
 import '../../database/database.dart';
 import '../../providers/app_providers.dart';
 import '../../services/gemma_service.dart';
 import '../../services/tts_service.dart';
+import '../../services/article_extractor.dart';
 import '../../services/rss_service.dart';
 import '../../widgets/common_widgets.dart';
 import 'package:intl/intl.dart';
@@ -23,6 +25,8 @@ class _ArticleReaderScreenState extends ConsumerState<ArticleReaderScreen> {
   String? _feedTitle;
   String _feedLanguage = 'it-IT';
   bool _isLoadingSummary = false;
+  bool _isLoadingFullText = false;
+  bool _fullTextFailed = false;
   TtsState _ttsState = TtsState.stopped;
   double _ttsSpeed = 0.5;
   bool _showSummary = false;
@@ -49,6 +53,33 @@ class _ArticleReaderScreenState extends ConsumerState<ArticleReaderScreen> {
       _feedTitle = feed?.title;
       _feedLanguage = langToTtsLocale(feed?.language);
     });
+
+    if (RssService.needsFullText(article.content, article.description)) {
+      _loadFullText();
+    }
+  }
+
+  /// Scarica la pagina dell'articolo, ne estrae il testo e lo salva in `content`.
+  Future<void> _loadFullText() async {
+    final article = _article;
+    if (article == null || _isLoadingFullText || article.url.isEmpty) return;
+    setState(() {
+      _isLoadingFullText = true;
+      _fullTextFailed = false;
+    });
+    try {
+      final text = await ArticleExtractor.fetch(article.url);
+      if (text == null) {
+        if (mounted) setState(() => _fullTextFailed = true);
+        return;
+      }
+      await ref.read(databaseProvider).saveArticleContent(article.id, text);
+      if (mounted) setState(() => _article = article.copyWith(content: Value(text)));
+    } catch (_) {
+      if (mounted) setState(() => _fullTextFailed = true);
+    } finally {
+      if (mounted) setState(() => _isLoadingFullText = false);
+    }
   }
 
   void _initTts() {
@@ -72,8 +103,8 @@ class _ArticleReaderScreenState extends ConsumerState<ArticleReaderScreen> {
 
     final article = _article!;
     final tt = Theme.of(context).textTheme;
-    final readableContent = RssService.extractReadableText(
-      article.content ?? article.description,
+    final readableContent = RssService.articleText(
+      article.content, article.description,
     );
 
     return Scaffold(
@@ -206,6 +237,39 @@ class _ArticleReaderScreenState extends ConsumerState<ArticleReaderScreen> {
                 ),
                 const SizedBox(height: 20),
 
+                if (_isLoadingFullText)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Row(
+                      children: [
+                        const SizedBox(
+                          width: 14, height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        const SizedBox(width: 10),
+                        Text('Caricamento articolo completo…', style: tt.bodySmall),
+                      ],
+                    ),
+                  )
+                else if (_fullTextFailed)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Articolo completo non disponibile (paywall o pagina protetta).',
+                            style: tt.bodySmall?.copyWith(color: AppTheme.textMuted),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: _loadFullText,
+                          child: const Text('Riprova'),
+                        ),
+                      ],
+                    ),
+                  ),
+
                 // Testo dell'articolo
                 if (readableContent.isNotEmpty)
                   SelectableText(
@@ -275,8 +339,8 @@ class _ArticleReaderScreenState extends ConsumerState<ArticleReaderScreen> {
 
   Future<void> _generateSummary() async {
     if (_article == null) return;
-    final content = RssService.extractReadableText(
-      _article!.content ?? _article!.description,
+    final content = RssService.articleText(
+      _article!.content, _article!.description,
     );
     if (content.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
