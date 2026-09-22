@@ -27,6 +27,14 @@ class GemmaException implements Exception {
       'Riassunto non riuscito${part != null ? ' ($part)' : ''}: $stage — $cause';
 }
 
+/// Prima riga significativa di un errore del motore (che spesso è un elenco di
+/// righe di stack), accorciata: è ciò che si mostra all'utente; il resto va
+/// nei dettagli.
+String summarizeGemmaError(String raw) {
+  final first = raw.split('\n').map((l) => l.trim()).firstWhere((l) => l.isNotEmpty, orElse: () => raw.trim());
+  return first.length > 240 ? '${first.substring(0, 240)}…' : first;
+}
+
 /// Esegue un prompt sul modello e restituisce il testo generato.
 typedef PromptRunner = Future<String> Function(String prompt);
 
@@ -114,6 +122,13 @@ class GemmaService {
   /// Blocchi processati al massimo; oltre, il resto dell'articolo è ignorato.
   static const _maxChunks = 6;
 
+  /// Lunghezza massima della risposta: 3-4 frasi in italiano sono ~500-700
+  /// caratteri. Oltre si interrompe la generazione: un modello piccolo può
+  /// non emettere mai la fine del testo e girare a vuoto fino ai token
+  /// disponibili, con un risultato inutile e tempi lunghi.
+  static const summaryMaxChars = 700;
+  static const partialMaxChars = 350;
+
   /// Riassume l'articolo. Se supera un blocco lo riassume a pezzi e poi
   /// riassume i riassunti parziali. Non ritorna mai un risultato vuoto: se
   /// qualcosa non va lancia una [GemmaException] che dice dove.
@@ -127,13 +142,16 @@ class GemmaService {
 
     final chunks = splitIntoChunks(content, chunkChars).take(_maxChunks).toList();
     if (chunks.length == 1) {
-      return _generate(_buildPrompt(title, chunks.first));
+      return _generate(_buildPrompt(title, chunks.first), maxChars: summaryMaxChars);
     }
 
     final partials = <String>[];
     for (var i = 0; i < chunks.length; i++) {
       try {
-        partials.add(await _generate(_buildPartPrompt(title, chunks[i], i + 1, chunks.length)));
+        partials.add(await _generate(
+          _buildPartPrompt(title, chunks[i], i + 1, chunks.length),
+          maxChars: partialMaxChars,
+        ));
       } on GemmaException catch (e) {
         throw e.withPart('parte ${i + 1} di ${chunks.length}');
       }
@@ -142,7 +160,7 @@ class GemmaService {
     var merged = partials.join('\n');
     if (merged.length > chunkChars) merged = merged.substring(0, chunkChars);
     try {
-      return await _generate(_buildPrompt(title, merged));
+      return await _generate(_buildPrompt(title, merged), maxChars: summaryMaxChars);
     } on GemmaException catch (e) {
       throw e.withPart('riassunto finale');
     }
@@ -173,9 +191,12 @@ class GemmaService {
     }
   }
 
-  Future<String> _generate(String prompt) async {
+  Future<String> _generate(String prompt, {required int maxChars}) async {
+    final watch = Stopwatch()..start();
     try {
-      final text = (await (_runner ?? _runOnModel)(prompt)).trim();
+      final text = (await (_runner?.call(prompt) ?? _runOnModel(prompt, maxChars))).trim();
+      debugPrint('[Gemma] generazione: ${watch.elapsed.inSeconds}s, '
+          'prompt ${prompt.length} caratteri → risposta ${text.length} caratteri');
       if (text.isEmpty) {
         throw const GemmaException('generazione', 'il modello ha restituito una risposta vuota');
       }
@@ -189,24 +210,78 @@ class GemmaService {
     }
   }
 
-  Future<String> _runOnModel(String prompt) async {
+  Future<String> _runOnModel(String prompt, int maxChars) async {
     InferenceModelSession? session;
     var step = 'creazione della sessione';
     try {
+      // topK 1 = scelta sempre del token più probabile: nei modelli piccoli
+      // porta a cicli ("è è è è…"). Un campionamento moderato li evita.
       session = await _model!.createSession(
-        temperature: 0.8,
+        temperature: 0.5,
         randomSeed: 1,
-        topK: 1,
+        topK: 40,
+        topP: 0.9,
       );
       step = 'invio del testo';
       await session.addQueryChunk(Message(text: prompt, isUser: true));
       step = 'generazione';
-      return await session.getResponse();
+      final out = await collectGuarded(session.getResponseAsync(), maxChars: maxChars);
+      if (out.cut) {
+        debugPrint('[Gemma] generazione interrotta (${out.text.length} caratteri): tetto o ciclo');
+        await session.stopGeneration();
+      }
+      return out.text;
     } catch (e) {
       throw GemmaException(step, e);
     } finally {
       await session?.close();
     }
+  }
+
+  /// Raccoglie la risposta token per token e la interrompe se supera
+  /// [maxChars] o se il modello entra in un ciclo, poi la ripulisce.
+  @visibleForTesting
+  static Future<({String text, bool cut})> collectGuarded(
+    Stream<String> tokens, {
+    required int maxChars,
+  }) async {
+    final buffer = StringBuffer();
+    var cut = false;
+    // `break` in un await-for annulla la sottoscrizione: niente token in più.
+    await for (final token in tokens) {
+      buffer.write(token);
+      final soFar = buffer.toString();
+      if (soFar.length >= maxChars || _endsWithLoop(soFar)) {
+        cut = true;
+        break;
+      }
+    }
+    return (text: cleanSummary(buffer.toString(), cut: cut), cut: cut);
+  }
+
+  /// Vero se la risposta finisce con lo stesso pezzetto ripetuto molte volte
+  /// ("è è è è è è" oppure "èèèèèèèè").
+  static bool _endsWithLoop(String text) {
+    final tail = text.length > 160 ? text.substring(text.length - 160) : text;
+    return RegExp(r'(\S{1,8})(?:\s+\1){5,}\s*$').hasMatch(tail) ||
+        RegExp(r'(.{1,4}?)\1{9,}$', dotAll: true).hasMatch(tail);
+  }
+
+  /// Toglie le ripetizioni a raffica e, se la risposta è stata interrotta,
+  /// la taglia all'ultima frase completa invece di lasciarla a metà.
+  @visibleForTesting
+  static String cleanSummary(String raw, {required bool cut}) {
+    var t = raw
+        .replaceAllMapped(RegExp(r'(\S{1,8})(?:\s+\1){3,}'), (m) => m[1]!) // "è è è è" → "è"
+        .replaceAllMapped(RegExp(r'(.{1,4}?)\1{9,}', dotAll: true), (m) => m[1]!) // "èèèèèèèè" → "è"
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (cut) {
+      final end = [t.lastIndexOf('.'), t.lastIndexOf('!'), t.lastIndexOf('?'), t.lastIndexOf('…')]
+          .reduce((a, b) => a > b ? a : b);
+      if (end >= 40) t = t.substring(0, end + 1);
+    }
+    return t;
   }
 
   /// Divide il testo in blocchi di al massimo [max] caratteri, spezzando
@@ -244,13 +319,13 @@ class GemmaService {
   }
 
   String _buildPrompt(String title, String content) =>
-      'Riassumi il seguente articolo in italiano in 3-4 frasi concise, '
-      'evidenziando i punti principali. Sii diretto e informativo.\n\n'
+      'Riassumi il seguente articolo in italiano in al massimo 3 frasi complete, '
+      'evidenziando i punti principali. Rispondi solo con il riassunto.\n\n'
       'Titolo: $title\n\nArticolo:\n$content\n\nRiassunto:';
 
   String _buildPartPrompt(String title, String content, int n, int total) =>
-      'Riassumi in italiano in 2 frasi questa parte ($n di $total) '
-      'dell\'articolo. Sii diretto e informativo.\n\n'
+      'Riassumi in italiano in al massimo 2 frasi questa parte ($n di $total) '
+      'dell\'articolo. Rispondi solo con il riassunto.\n\n'
       'Titolo: $title\n\nParte $n:\n$content\n\nRiassunto:';
 
   // ── Import file locale ────────────────────────────────────────────────────
@@ -328,35 +403,49 @@ class GemmaService {
 
   Future<void> _extractTarGz(File tarGzFile, {void Function(double)? onProgress}) async {
     onProgress?.call(0);
+    final gzipStream = tarGzFile.openRead().transform(gzip.decoder);
+    final reader = TarReader(gzipStream);
+    File? tmp;
     try {
-      final gzipStream = tarGzFile.openRead().transform(gzip.decoder);
-      final reader = TarReader(gzipStream);
       bool found = false;
       while (await reader.moveNext()) {
         final entry = reader.current;
         if (entry.type == TypeFlag.reg && _isModelFile(entry.name)) {
           found = true;
           final dest = await _destPath(p.basename(entry.name));
-          final tmp = File('$dest.tmp');
+          tmp = File('$dest.tmp');
           final total = entry.header.size;
           int written = 0;
-          final sink = tmp.openWrite();
-          await for (final chunk in entry.contents) {
-            sink.add(chunk);
-            written += chunk.length;
-            if (total > 0) onProgress?.call(written / total);
+
+          // Ogni pezzo va scritto PRIMA di leggere il successivo. Con
+          // `sink.add(chunk)` senza attendere, il lettore tar/gzip riusa i suoi
+          // buffer mentre i dati sono ancora in coda: su un modello da 3,2 GB
+          // il 90% dei blocchi risultava alterato e il modello non si caricava.
+          final out = await tmp.open(mode: FileMode.write);
+          try {
+            await for (final chunk in entry.contents) {
+              await out.writeFrom(chunk);
+              written += chunk.length;
+              if (total > 0) onProgress?.call(written / total);
+            }
+            await out.flush();
+          } finally {
+            await out.close();
           }
-          await sink.flush();
-          await sink.close();
+          if (total > 0 && written != total) {
+            throw Exception('Estrazione incompleta: $written byte su $total.');
+          }
           await tmp.rename(dest);
+          tmp = null;
           break;
         }
       }
-      await reader.cancel();
       if (!found) throw Exception('Nessun file modello nel tar.gz.');
       onProgress?.call(1);
-    } catch (e) {
-      rethrow;
+    } finally {
+      await reader.cancel();
+      // Se qualcosa è andato storto non lasciare sul telefono un file da GB.
+      if (tmp != null && await tmp.exists()) await tmp.delete();
     }
   }
 

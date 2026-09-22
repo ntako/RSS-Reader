@@ -325,6 +325,7 @@ class _GemmaSettingsCard extends ConsumerStatefulWidget {
 class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
   final _urlCtrl = TextEditingController();
   bool _copyingLocal = false;
+  bool _showErrorDetails = false;
 
   @override
   void dispose() {
@@ -403,17 +404,43 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
             ),
           ] else ...[
             if (modelState == GemmaModelState.error) ...[
-              Text(
-                'Il modello installato non si carica:\n'
-                '${ref.read(gemmaModelProvider.notifier).lastError ?? 'errore sconosciuto'}\n'
-                'Scegli un altro file (formato LiteRT).',
-                style: tt.bodySmall?.copyWith(color: AppTheme.error),
-              ),
+              Builder(builder: (_) {
+                final raw = ref.read(gemmaModelProvider.notifier).lastError ?? 'errore sconosciuto';
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Il modello installato non si carica:\n${summarizeGemmaError(raw)}',
+                      style: tt.bodySmall?.copyWith(color: AppTheme.error),
+                    ),
+                    if (raw.trim() != summarizeGemmaError(raw)) ...[
+                      TextButton(
+                        style: TextButton.styleFrom(
+                          padding: EdgeInsets.zero,
+                          minimumSize: const Size(0, 32),
+                          alignment: Alignment.centerLeft,
+                        ),
+                        onPressed: () => setState(() => _showErrorDetails = !_showErrorDetails),
+                        child: Text(_showErrorDetails ? 'Nascondi dettagli' : 'Mostra dettagli'),
+                      ),
+                      if (_showErrorDetails)
+                        SelectableText(raw, style: tt.bodySmall?.copyWith(color: AppTheme.textMuted)),
+                    ],
+                    const SizedBox(height: 4),
+                    Text(
+                      'Se hai appena importato il file, riprova: un modello copiato male '
+                      'va reimportato. Altrimenti scegli un altro modello.',
+                      style: tt.bodySmall,
+                    ),
+                  ],
+                );
+              }),
               const SizedBox(height: 12),
             ],
             Text(
-              'Scarica da Kaggle → tab LiteRT → gemma-2-2b-it-cpu-int4 (~1.3 GB). '
-              'Formati supportati: .task, .bin, .tflite (anche in .zip o .tar.gz).',
+              'Consigliato: Gemma 3 1B IT (~0,5 GB, file .task) da Hugging Face → '
+              'litert-community/Gemma3-1B-IT. Sono supportati anche Gemma 3 270M e Gemma 3n. '
+              'Formati: .task, .bin, .tflite (anche in .zip o .tar.gz).',
               style: tt.bodySmall,
             ),
             const SizedBox(height: 12),

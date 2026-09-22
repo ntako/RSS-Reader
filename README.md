@@ -147,11 +147,17 @@ Il task periodico gira a intervalli regolari (da 1 a 12 ore) e WorkManager rifiu
 
 ### 🤖 Riassunti con Gemma
 
-Gemma è già integrato (`flutter_gemma`), serve solo il modello:
+Gemma è già integrato (`flutter_gemma`), serve solo il modello. Il plugin usa MediaPipe `tasks-genai` 0.10.29 e supporta **Gemma 3** (1B e 270M), Gemma 3n, Qwen, Phi-4, DeepSeek e SmolLM; **Gemma 2 non è nella lista dei modelli supportati**.
 
-1. Scarica da [Kaggle](https://www.kaggle.com/models/google/gemma) il formato **LiteRT**, ad esempio `gemma-2-2b-it-cpu-int4` (~1,3 GB). Sono supportati `.task`, `.bin` e `.tflite`, anche dentro `.zip` o `.tar.gz`.
-2. In *Impostazioni → Gemma AI* scegli **Scegli file locale** oppure incolla un **URL download**.
+1. Scarica **Gemma 3 1B IT** (~0,5 GB, file `.task`) da Hugging Face: [litert-community/Gemma3-1B-IT](https://huggingface.co/litert-community/Gemma3-1B-IT). Serve un account e l'accettazione della licenza di Gemma. Sono supportati `.task`, `.bin` e `.tflite`, anche dentro `.zip` o `.tar.gz`.
+2. In *Impostazioni → Gemma AI* scegli **Scegli file locale** oppure incolla un **URL download**. Un archivio da 2-3 GB richiede minuti e altrettanto spazio libero sul telefono.
 3. Nel reader tocca **Riassunto AI**.
+
+**Qualità e tempi.** I modelli piccoli (1B) possono entrare in un ciclo (`è è è è…`) e non emettere mai la fine del testo. Per questo la generazione usa un campionamento moderato (`topK` 40, `topP` 0,9, temperatura 0,5), si ferma da sola oltre ~700 caratteri (350 per i riassunti parziali) o appena rileva una ripetizione, e toglie la frase lasciata a metà. Ogni generazione scrive nel log tempo e lunghezze: `adb logcat -s flutter:V | grep "\[Gemma\]"`.
+
+Gli articoli lunghi sono divisi in blocchi da ~1800 caratteri (massimo 6): ogni blocco viene riassunto e poi i riassunti parziali vengono riassunti di nuovo. La finestra di contesto è di 1024 token (`_maxTokens` in `lib/services/gemma_service.dart`): se il modello non parte su un telefono con poca RAM, abbassa `_maxTokens` e `chunkChars`. Su un emulatore Gemma può essere molto lento o non funzionare: meglio un dispositivo reale.
+
+> **Storia di un difetto.** Una prima versione dell'importazione da `.tar.gz` scriveva i dati senza attendere il disco e, su un modello da 3,2 GB, alterava circa il 90% dei blocchi: il motore rispondeva con un errore sul tokenizer (`sentencepiece_processor.cc … ParseFromArray`) pur essendo il file di partenza valido. Ora l'estrazione è verificata byte per byte (test in `gemma_service_test.dart`). Se hai importato un modello con una versione precedente, **reimportalo**: il file già copiato resta alterato.
 
 **Se qualcosa non va lo vedi.** Un modello che non si carica all'avvio mostra il chip rosso **Errore** in *Impostazioni → Gemma AI* con il motivo, e nel reader compare "Modello Gemma non caricabile". Un riassunto che fallisce mostra un messaggio che dice la fase (creazione della sessione, invio del testo, generazione) e, per gli articoli lunghi, quale parte (*parte 2 di 4*, *riassunto finale*). Gli stessi dettagli, con lo stack, sono nel log:
 
