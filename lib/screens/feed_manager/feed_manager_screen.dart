@@ -327,10 +327,44 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
   bool _copyingLocal = false;
   bool _showErrorDetails = false;
 
+  /// Mostra i controlli per scegliere un nuovo modello anche quando uno è
+  /// già pronto: di default restano nascosti per non suggerire di continuo
+  /// di cambiare un modello che funziona.
+  bool _showReplace = false;
+
   @override
   void dispose() {
     _urlCtrl.dispose();
     super.dispose();
+  }
+
+  String _fileName(String path) => path.split(RegExp(r'[\\/]')).last;
+
+  /// Prima di sostituire un modello che sta già funzionando conviene
+  /// chiedere conferma: è un'operazione da minuti e diversi GB, non facile
+  /// da annullare se ci si accorge subito dopo di aver scelto il file sbagliato.
+  Future<bool> _confirmReplace(String withWhat) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppTheme.surfaceHigh,
+        title: Text('Sostituire il modello?', style: Theme.of(context).textTheme.titleLarge),
+        content: Text(
+          'Il modello caricato ora verrà sostituito con $withWhat. '
+          'Può richiedere qualche minuto e diversi GB liberi.',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Annulla')),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: AppTheme.accent),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Sostituisci'),
+          ),
+        ],
+      ),
+    );
+    return ok ?? false;
   }
 
   Future<void> _pickLocalFile() async {
@@ -343,7 +377,14 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
     final path = result?.files.single.path;
     if (path == null || !mounted) return;
 
-    setState(() => _copyingLocal = true);
+    final wasReady = ref.read(gemmaModelProvider).$1 == GemmaModelState.ready;
+    if (wasReady && !await _confirmReplace(_fileName(path))) return;
+    if (!mounted) return;
+
+    setState(() {
+      _copyingLocal = true;
+      _showReplace = false;
+    });
     ref.read(gemmaModelProvider.notifier).loadFromLocalFile(path).catchError((e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -356,10 +397,63 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
     });
   }
 
+  Future<void> _downloadFromUrl() async {
+    final url = _urlCtrl.text.trim();
+    if (url.isEmpty) return;
+
+    final wasReady = ref.read(gemmaModelProvider).$1 == GemmaModelState.ready;
+    if (wasReady && !await _confirmReplace('quello scaricato da questo URL')) return;
+    if (!mounted) return;
+
+    setState(() => _showReplace = false);
+    ref.read(gemmaModelProvider.notifier).download(url).catchError((e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Download fallito: $e'),
+          backgroundColor: AppTheme.error,
+        ));
+      }
+    });
+  }
+
+  Future<void> _setBackend(bool useGpu) async {
+    await ref.read(gemmaModelProvider.notifier).setBackend(useGpu ? 'gpu' : 'cpu');
+    // `backend` non fa parte dello stato osservato da `ref.watch`: senza
+    // questo la levetta tornerebbe visivamente indietro finché qualcos'altro
+    // non ridisegna la card.
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _removeModel() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppTheme.surfaceHigh,
+        title: Text('Rimuovere il modello?', style: Theme.of(context).textTheme.titleLarge),
+        content: Text(
+          'Il file resta sul telefono finché non lo reinstalli: per riassumere gli '
+          'articoli dovrai scaricarlo o importarlo di nuovo.',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Annulla')),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: AppTheme.error),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Rimuovi'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await ref.read(gemmaModelProvider.notifier).removeModel();
+  }
+
   @override
   Widget build(BuildContext context) {
     final (modelState, progress) = ref.watch(gemmaModelProvider);
+    final notifier = ref.read(gemmaModelProvider.notifier);
     final tt = Theme.of(context).textTheme;
+    final busy = modelState == GemmaModelState.downloading || modelState == GemmaModelState.checking;
 
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -375,12 +469,85 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
               _statusChip(modelState),
             ],
           ),
-          const SizedBox(height: 12),
-          if (modelState == GemmaModelState.ready) ...[
-            Text(
-              'Modello caricato e pronto.',
-              style: tt.bodySmall?.copyWith(color: AppTheme.success),
+          if (notifier.gpuDowngradedByCrash) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: AppTheme.error.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: AppTheme.error.withOpacity(0.3)),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.warning_amber_rounded, size: 16, color: AppTheme.error),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'La GPU ha causato un arresto anomalo all\'ultimo avvio: è stata '
+                      'disattivata automaticamente. Puoi riattivarla qui sotto.',
+                      style: tt.bodySmall?.copyWith(color: AppTheme.error),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: () {
+                      notifier.acknowledgeGpuDowngrade();
+                      setState(() {});
+                    },
+                    child: const Icon(Icons.close, size: 16, color: AppTheme.error),
+                  ),
+                ],
+              ),
             ),
+          ],
+          const SizedBox(height: 12),
+
+          // ── Backend: CPU o GPU, indipendente da quale modello è caricato ──
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            value: notifier.backend == 'gpu',
+            onChanged: busy ? null : _setBackend,
+            activeThumbColor: AppTheme.accent,
+            title: Text('Usa la GPU (sperimentale)', style: tt.bodyMedium),
+            subtitle: Text(
+              'Più veloce su alcuni dispositivi. Su altri il driver GPU manda in '
+              'crash l\'app: se succede, al riavvio successivo torna da sola alla CPU.',
+              style: tt.bodySmall,
+            ),
+          ),
+          const Divider(color: AppTheme.divider, height: 20),
+
+          if (modelState == GemmaModelState.ready) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Modello caricato e pronto.',
+                    style: tt.bodySmall?.copyWith(color: AppTheme.success),
+                  ),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 32)),
+                  onPressed: () => setState(() => _showReplace = !_showReplace),
+                  child: Text(_showReplace ? 'Annulla' : 'Sostituisci'),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    padding: EdgeInsets.zero,
+                    minimumSize: const Size(0, 32),
+                    foregroundColor: AppTheme.error,
+                  ),
+                  onPressed: _removeModel,
+                  child: const Text('Rimuovi'),
+                ),
+              ],
+            ),
+            if (_showReplace) ...[
+              const SizedBox(height: 12),
+              _modelSourceControls(tt),
+            ],
           ] else if (modelState == GemmaModelState.downloading) ...[
             Row(
               children: [
@@ -402,10 +569,12 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
                 minHeight: 4,
               ),
             ),
+          ] else if (modelState == GemmaModelState.checking) ...[
+            Text('Ricarico il modello…', style: tt.bodySmall?.copyWith(color: AppTheme.accentSoft)),
           ] else ...[
             if (modelState == GemmaModelState.error) ...[
               Builder(builder: (_) {
-                final raw = ref.read(gemmaModelProvider.notifier).lastError ?? 'errore sconosciuto';
+                final raw = notifier.lastError ?? 'errore sconosciuto';
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -427,84 +596,100 @@ class _GemmaSettingsCardState extends ConsumerState<_GemmaSettingsCard> {
                         SelectableText(raw, style: tt.bodySmall?.copyWith(color: AppTheme.textMuted)),
                     ],
                     const SizedBox(height: 4),
-                    Text(
-                      'Se hai appena importato il file, riprova: un modello copiato male '
-                      'va reimportato. Altrimenti scegli un altro modello.',
-                      style: tt.bodySmall,
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Se hai appena importato il file, riprova: un modello copiato male '
+                            'va reimportato. Altrimenti scegli un altro modello o rimuovilo.',
+                            style: tt.bodySmall,
+                          ),
+                        ),
+                        TextButton(
+                          style: TextButton.styleFrom(
+                            padding: EdgeInsets.zero,
+                            minimumSize: const Size(0, 32),
+                            foregroundColor: AppTheme.error,
+                          ),
+                          onPressed: _removeModel,
+                          child: const Text('Rimuovi'),
+                        ),
+                      ],
                     ),
                   ],
                 );
               }),
               const SizedBox(height: 12),
             ],
-            Text(
-              'Consigliato: Gemma 3 1B IT (~0,5 GB, file .task) da Hugging Face → '
-              'litert-community/Gemma3-1B-IT. Sono supportati anche Gemma 3 270M e Gemma 3n. '
-              'Formati: .task, .bin, .tflite (anche in .zip o .tar.gz).',
-              style: tt.bodySmall,
-            ),
-            const SizedBox(height: 12),
-
-            // ── Opzione 1: file locale ────────────────────────────────────
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: _pickLocalFile,
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppTheme.accent,
-                  side: const BorderSide(color: AppTheme.accent),
-                ),
-                icon: const Icon(Icons.folder_open_outlined, size: 16),
-                label: const Text('Scegli file locale (.task / .bin / .zip…)'),
-              ),
-            ),
-
-            const SizedBox(height: 10),
-            Row(children: [
-              const Expanded(child: Divider(color: AppTheme.divider)),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                child: Text('oppure', style: tt.bodySmall),
-              ),
-              const Expanded(child: Divider(color: AppTheme.divider)),
-            ]),
-            const SizedBox(height: 10),
-
-            // ── Opzione 2: URL download ───────────────────────────────────
-            TextField(
-              controller: _urlCtrl,
-              style: const TextStyle(color: AppTheme.textPrimary, fontSize: 13),
-              decoration: const InputDecoration(
-                hintText: 'https://…',
-                labelText: 'URL download modello',
-                prefixIcon: Icon(Icons.link, size: 16, color: AppTheme.textMuted),
-                isDense: true,
-              ),
-              keyboardType: TextInputType.url,
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: () {
-                  final url = _urlCtrl.text.trim();
-                  if (url.isEmpty) return;
-                  ref.read(gemmaModelProvider.notifier).download(url).catchError((e) {
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        content: Text('Download fallito: $e'),
-                        backgroundColor: AppTheme.error,
-                      ));
-                    }
-                  });
-                },
-                icon: const Icon(Icons.download_outlined, size: 16),
-                label: const Text('Scarica da URL'),
-              ),
-            ),
+            _modelSourceControls(tt),
           ],
         ],
       ),
+    );
+  }
+
+  /// Scelta del file locale o dell'URL da cui installare un modello: usata
+  /// sia quando non c'è ancora nessun modello sia, se l'utente lo chiede,
+  /// per sostituire quello già pronto.
+  Widget _modelSourceControls(TextTheme tt) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Consigliato: Gemma 3 1B IT (~0,5 GB, file .task) da Hugging Face → '
+          'litert-community/Gemma3-1B-IT. Sono supportati anche Gemma 3 270M e Gemma 3n. '
+          'Formati: .task, .bin, .tflite (anche in .zip o .tar.gz).',
+          style: tt.bodySmall,
+        ),
+        const SizedBox(height: 12),
+
+        // ── Opzione 1: file locale ────────────────────────────────────
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _pickLocalFile,
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppTheme.accent,
+              side: const BorderSide(color: AppTheme.accent),
+            ),
+            icon: const Icon(Icons.folder_open_outlined, size: 16),
+            label: const Text('Scegli file locale (.task / .bin / .zip…)'),
+          ),
+        ),
+
+        const SizedBox(height: 10),
+        Row(children: [
+          const Expanded(child: Divider(color: AppTheme.divider)),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Text('oppure', style: tt.bodySmall),
+          ),
+          const Expanded(child: Divider(color: AppTheme.divider)),
+        ]),
+        const SizedBox(height: 10),
+
+        // ── Opzione 2: URL download ───────────────────────────────────
+        TextField(
+          controller: _urlCtrl,
+          style: const TextStyle(color: AppTheme.textPrimary, fontSize: 13),
+          decoration: const InputDecoration(
+            hintText: 'https://…',
+            labelText: 'URL download modello',
+            prefixIcon: Icon(Icons.link, size: 16, color: AppTheme.textMuted),
+            isDense: true,
+          ),
+          keyboardType: TextInputType.url,
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: _downloadFromUrl,
+            icon: const Icon(Icons.download_outlined, size: 16),
+            label: const Text('Scarica da URL'),
+          ),
+        ),
+      ],
     );
   }
 

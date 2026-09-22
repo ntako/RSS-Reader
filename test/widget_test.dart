@@ -130,6 +130,24 @@ void main() {
     expect(find.text('Oppure scegli tra le fonti consigliate'), findsOneWidget);
   });
 
+  testApp('il controllo GPU in Impostazioni si può attivare senza eccezioni', (tester) async {
+    await launchApp(tester);
+    await tester.tap(find.text('Impostazioni'));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    final gpuSwitch = find.widgetWithText(SwitchListTile, 'Usa la GPU (sperimentale)');
+    expect(gpuSwitch, findsOneWidget);
+    expect(tester.widget<SwitchListTile>(gpuSwitch).value, isFalse, reason: 'CPU di default');
+
+    // Nessun modello installato: attivarla salva solo la preferenza, senza
+    // tentare un caricamento — non deve quindi passare da "Verifica…".
+    await tester.tap(gpuSwitch);
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(tester.widget<SwitchListTile>(gpuSwitch).value, isTrue);
+    expect(find.text('Non configurato'), findsOneWidget);
+  });
+
   testApp('da Impostazioni si apre il catalogo delle fonti consigliate', (tester) async {
     await launchApp(tester);
 

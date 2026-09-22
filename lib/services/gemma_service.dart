@@ -8,7 +8,14 @@ import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:tar/tar.dart';
 
+import 'app_settings.dart';
+
 enum GemmaStatus { notLoaded, loading, ready, error }
+
+/// Motore su cui gira l'inferenza. La GPU può essere molto più veloce, ma il
+/// delegate GPU di alcuni dispositivi manda in crash l'intero processo
+/// invece di lanciare un'eccezione: vedi [GemmaService.loadModel].
+enum GemmaBackend { cpu, gpu }
 
 /// Un riassunto che non è riuscito, con la fase in cui si è fermato (creazione
 /// della sessione, invio del testo, generazione…) e, per gli articoli lunghi,
@@ -81,8 +88,27 @@ class GemmaService {
 
   // ── Caricamento modello ───────────────────────────────────────────────────
 
-  Future<void> loadModel() async {
+  /// Carica il modello installato sul backend indicato.
+  ///
+  /// Il delegate GPU di alcuni dispositivi manda in crash l'intero processo
+  /// invece di lanciare un'eccezione Dart: `try`/`catch` non lo vede. Per
+  /// questo il tentativo viene segnato su disco PRIMA della chiamata nativa
+  /// rischiosa (`AppSettings.markGemmaLoadAttempt`) e il segno viene tolto
+  /// subito dopo, che la chiamata riesca o fallisca normalmente — è la
+  /// `finally` qui sotto. Se l'app si riavvia e trova ancora il segno,
+  /// l'ultimo tentativo non ha attraversato quella `finally`: quasi
+  /// certamente un crash. Chi chiama questo metodo all'avvio dell'app
+  /// (`GemmaModelNotifier.init`) legge quel segno e, se il backend era la
+  /// GPU, la disattiva prima di riprovare.
+  Future<void> loadModel({GemmaBackend backend = GemmaBackend.cpu}) async {
     _status = GemmaStatus.loading;
+    // Il modello precedente tiene risorse native: va rilasciato prima di
+    // caricarne un altro, altrimenti un cambio di backend o la sostituzione
+    // del file accumulano sessioni mai chiuse.
+    await _model?.close();
+    _model = null;
+
+    await AppSettings.markGemmaLoadAttempt(backend.name);
     try {
       final path = await GemmaService.installedModelPath;
       if (path == null) throw Exception('Nessun modello installato.');
@@ -99,14 +125,17 @@ class GemmaService {
         modelType: ModelType.gemmaIt,
         fileType: fileType,
         maxTokens: _maxTokens,
+        preferredBackend: backend == GemmaBackend.gpu ? PreferredBackend.gpu : PreferredBackend.cpu,
       );
 
       _status = GemmaStatus.ready;
     } catch (e, st) {
       _status = GemmaStatus.error;
       _errorMessage = e.toString();
-      debugPrint('[Gemma] caricamento del modello fallito: $e\n$st');
+      debugPrint('[Gemma] caricamento del modello fallito (backend: ${backend.name}): $e\n$st');
       rethrow;
+    } finally {
+      await AppSettings.clearGemmaLoadAttempt();
     }
   }
 
@@ -341,6 +370,40 @@ class GemmaService {
     return p.join(dir, 'gemma_model$ext');
   }
 
+  /// Tutti i nomi che [installedModelPath] può riconoscere come modello.
+  static Future<List<File>> _candidateModelFiles() async {
+    final dir = await _dir();
+    return [
+      for (final ext in [..._taskExts, ..._binaryExts]) File(p.join(dir, 'gemma_model$ext')),
+    ];
+  }
+
+  /// Elimina il modello installato, in qualunque formato sia.
+  ///
+  /// Serve sia per "Rimuovi modello" sia — dentro [_replaceInstalledModel] —
+  /// per fare spazio a uno nuovo con un'estensione diversa: senza questo,
+  /// un `.bin` sostituito da un `.task` lascerebbe entrambi i file sul
+  /// telefono, e [installedModelPath] avrebbe sempre restituito il vecchio
+  /// `.task` (compare per primo nell'elenco delle estensioni), rendendo
+  /// impossibile passare a un modello di formato diverso.
+  static Future<void> deleteInstalledModel() async {
+    for (final f in await _candidateModelFiles()) {
+      if (await f.exists()) await f.delete();
+    }
+  }
+
+  /// Sposta [tmp] in [dest] solo ora che la copia/estrazione è completa,
+  /// eliminando prima ogni altro file modello (estensioni diverse comprese).
+  /// Fino a questo momento il modello precedente, se c'era, resta intatto:
+  /// un download o un'estrazione falliti a metà non cancellano un modello
+  /// funzionante.
+  static Future<void> _replaceInstalledModel(File tmp, File dest) async {
+    for (final f in await _candidateModelFiles()) {
+      if (f.path != dest.path && await f.exists()) await f.delete();
+    }
+    await tmp.rename(dest.path);
+  }
+
   Future<void> copyFromLocalFile(
     String sourcePath, {
     void Function(double progress)? onProgress,
@@ -370,7 +433,7 @@ class GemmaService {
         if (total > 0) onProgress?.call(copied / total);
         return chunk;
       }).pipe(sink);
-      await tmp.rename(dest);
+      await _replaceInstalledModel(tmp, File(dest));
     } catch (e) {
       if (await tmp.exists()) await tmp.delete();
       rethrow;
@@ -379,6 +442,7 @@ class GemmaService {
 
   Future<void> _extractZip(File zipFile, {void Function(double)? onProgress}) async {
     onProgress?.call(0);
+    File? tmp;
     try {
       final inputStream = InputFileStream(zipFile.path);
       final archive = ZipDecoder().decodeBuffer(inputStream);
@@ -389,14 +453,15 @@ class GemmaService {
         ),
       );
       final dest = await _destPath(p.basename(entry.name));
-      final tmp = File('$dest.tmp');
+      tmp = File('$dest.tmp');
       final outputStream = OutputFileStream(tmp.path);
       entry.writeContent(outputStream);
       outputStream.closeSync();
       inputStream.closeSync();
       onProgress?.call(1);
-      await tmp.rename(dest);
+      await _replaceInstalledModel(tmp, File(dest));
     } catch (e) {
+      if (tmp != null && await tmp.exists()) await tmp.delete();
       rethrow;
     }
   }
@@ -435,7 +500,7 @@ class GemmaService {
           if (total > 0 && written != total) {
             throw Exception('Estrazione incompleta: $written byte su $total.');
           }
-          await tmp.rename(dest);
+          await _replaceInstalledModel(tmp, File(dest));
           tmp = null;
           break;
         }
@@ -467,7 +532,7 @@ class GemmaService {
         if (total > 0) onProgress?.call(received / total);
         return chunk;
       }).pipe(sink);
-      await tmp.rename(dest);
+      await _replaceInstalledModel(tmp, File(dest));
     } catch (e) {
       if (await tmp.exists()) await tmp.delete();
       rethrow;
